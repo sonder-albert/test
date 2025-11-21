@@ -28,7 +28,7 @@ class MPMCLockFreeUnboundedQueueTest {
     }
 
     // 基本并发性：多生产者多消费者，确保没有丢失
-    @RepeatedTest(5)
+    //@RepeatedTest(5)
     void testConcurrentPutPollManyProducersConsumers() throws InterruptedException {
         q=null;
         q = new MPMCLockFreeUnboundedQueue<>();

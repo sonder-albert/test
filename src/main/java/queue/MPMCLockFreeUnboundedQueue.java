@@ -303,6 +303,8 @@ public class MPMCLockFreeUnboundedQueue<E> {
         public void run() {
             // 线程退出时，将自己在消费者表中的记录设为 MAX，避免阻碍回收
             LONG_ARRAY_HANDLE.setRelease(CONSUMER_TABLE, threadSlot, Long.MAX_VALUE);
+            // producer epoch clean
+            LONG_ARRAY_HANDLE.setRelease(PRODUCER_TABLE, threadSlot, Long.MAX_VALUE);
             //reclaim to global
             long minInuse = getGlobalMinUsingEpoch(CONSUMER_TABLE, PRODUCER_TABLE);
             for (int i = size; i >= 0; i--) {
@@ -558,7 +560,7 @@ public class MPMCLockFreeUnboundedQueue<E> {
                 while (true) {
                     long consumerEpoch = CONSUMER_PRE_TOUCH_EPOCH.getAcquire();
                     long producerEpoch = updatePublishEpoch();
-
+                    //todo may happen fake empty?need jcstress test
                     if (producerEpoch == consumerEpoch) {
                         return null;
                     }
