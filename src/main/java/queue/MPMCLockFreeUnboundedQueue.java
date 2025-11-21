@@ -4,7 +4,7 @@ import jdk.internal.vm.annotation.Contended;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.Arrays;
+import java.lang.ref.Cleaner;
 import java.util.Objects;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
@@ -16,44 +16,28 @@ import java.util.concurrent.locks.LockSupport;
  * @author sonder
  */
 public class MPMCLockFreeUnboundedQueue<E> {
-    //MEMORY ACCESS
-    private static final VarHandle OBJECT_VARHANDLE;
+    //SEGMENT
+    static final int STRIDE = 8;
+    static final int SEGMENT_CAPACITY = 1024;
+    static final int SEGMENT_MASK = SEGMENT_CAPACITY - 1;
+
+    private static final VarHandle LONG_ARRAY_HANDLE;
+    private static final VarHandle OBJECT_ARRAY_HANDLE;
 
     static {
         try {
-            OBJECT_VARHANDLE = MethodHandles.lookup().findVarHandle(PaddedObject.class, "value", Object.class);
-        } catch (IllegalArgumentException | NoSuchFieldException | IllegalAccessException e) {
+            LONG_ARRAY_HANDLE = MethodHandles.arrayElementVarHandle(long[].class);
+            OBJECT_ARRAY_HANDLE = MethodHandles.arrayElementVarHandle(Object[].class);
+        } catch (IllegalArgumentException e) {
             throw new RuntimeException(e);
         }
     }
 
-    //SEGMENT
-    static final int STRIDE = 4;
-    static final int SEGMENT_CAPACITY = 1024;
-    static final int SEGMENT_MASK = SEGMENT_CAPACITY - 1;
-
     @Contended
-    static final class PaddedLong {
-        long value;
-
-        public PaddedLong(long value) {
-            this.value = value;
-        }
-    }
-
-    @Contended
-    static final class PaddedObject {
-        Object value;
-
-        public PaddedObject(Object value) {
-            this.value = value;
-        }
-    }
-
     static final class Segment<E> {
-        //actual storage (accessed via ARRAY_ELEM)
-        final PaddedObject[] items;
-        // per-slot sequence numbers (accessed via LONG_ARRAY_ELEM)
+        //actual storage
+        final E[] items;
+        // per-slot sequence numbers,liner based
         final long[] sequences;
         final AtomicReference<Segment<E>> next = new AtomicReference<>(null);
         //该 segment 的 0 槽对应的全局 seq
@@ -61,48 +45,49 @@ public class MPMCLockFreeUnboundedQueue<E> {
         final int capacity;
         volatile long epoch;
 
-        Segment(long baseSeq, long epoch) {
+        @SuppressWarnings("unchecked")
+        Segment(long baseSeq) {
+            this.baseSeq = baseSeq;
             this.capacity = SEGMENT_CAPACITY;
-            this.items = new PaddedObject[capacity];
-            this.sequences = new long[capacity * STRIDE];
+            int paddedLength = capacity * STRIDE;
+            this.items = (E[]) new Object[paddedLength];
+            this.sequences = new long[paddedLength];
             // 初始化 sequences：slot i 对应的 index = i*stride
             for (int i = 0; i < capacity; i++) {
-                VarHandle.releaseFence();
                 this.sequences[i * STRIDE] = baseSeq + i;
             }
+            VarHandle.releaseFence();
         }
 
         public boolean ownsSeq(long seq) {
             return seq >= baseSeq && seq < baseSeq + capacity;
         }
 
-        public void lazyReset(long newBase, long seq) {
+        public void lazyReset(long newBase) {
             this.baseSeq = newBase;
-            this.epoch = seq;
             this.next.setRelease(null);
             int slot = (int) (newBase & SEGMENT_MASK);
             this.sequences[slot * STRIDE] = newBase;
-            this.items[slot].value = null;
+            this.items[slot] = null;
+            VarHandle.releaseFence();
         }
 
     }
 
     static final class MPSCRingBuffer<E> {
-        private final E[] buffer;
+        private final Object[] buffer;
         private final int mask;
-        private volatile long producerIndex = 0;
-        private volatile long consumerIndex = 0;
+        private long producerIndex = 0;
+        private long consumerIndex = 0;
 
         private static final VarHandle P_INDEX;
         private static final VarHandle C_INDEX;
-        private static final VarHandle ARRAY_ELEM;
 
         static {
             try {
                 MethodHandles.Lookup l = MethodHandles.lookup();
                 P_INDEX = l.findVarHandle(MPSCRingBuffer.class, "producerIndex", long.class);
                 C_INDEX = l.findVarHandle(MPSCRingBuffer.class, "consumerIndex", long.class);
-                ARRAY_ELEM = MethodHandles.arrayElementVarHandle(Object[].class);
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
@@ -110,38 +95,56 @@ public class MPMCLockFreeUnboundedQueue<E> {
 
         @SuppressWarnings("unchecked")
         public MPSCRingBuffer(int capacity) {
-            buffer = (E[]) new Object[capacity];
+            buffer = new Segment[capacity];
             mask = capacity - 1;
         }
 
-        E poll() {
+        E poll(long seq) {
             long p = (long) P_INDEX.getOpaque(this);
             long c = (long) C_INDEX.getOpaque(this);
             if (c >= p) {
                 return null;
             }
             int slot = (int) (p & mask);
-            @SuppressWarnings("unchecked")
-            E e = (E) ARRAY_ELEM.getAcquire(buffer, slot);
+            VarHandle.acquireFence();
+            Segment<E> e = (Segment<E>) buffer[slot];
             if (e == null) {
                 return null;
             }
-            ARRAY_ELEM.setRelease(buffer, slot, null);
+            e.lazyReset(seq);
+            buffer[slot] = null;
+            VarHandle.releaseFence();
             C_INDEX.setRelease(this, c + 1);
-            return e;
+            return (E) e;
         }
 
-        public boolean offer(E e) {
+        E peek() {
+            long p = (long) P_INDEX.getOpaque(this);
+            long c = (long) C_INDEX.getOpaque(this);
+            if (c >= p) {
+                return null;
+            }
+            int slot = (int) (p & mask);
+            VarHandle.acquireFence();
+            Segment<E> e = (Segment<E>) buffer[slot];
+            if (e == null) {
+                return null;
+            }
+            return (E) e;
+        }
+
+        public void offer(E e) {
             while (true) {
                 long p = (long) P_INDEX.getOpaque(this);
                 long c = (long) C_INDEX.getOpaque(this);
                 if (p - c >= buffer.length) {
-                    return false;
+                    return;
                 }
                 if (P_INDEX.compareAndSet(this, p, p + 1)) {
                     int slot = (int) (p & mask);
-                    ARRAY_ELEM.setRelease(buffer, slot, e);
-                    return true;
+                    VarHandle.releaseFence();
+                    buffer[slot] = e;
+                    return;
                 }
                 Thread.onSpinWait();
             }
@@ -149,81 +152,120 @@ public class MPMCLockFreeUnboundedQueue<E> {
     }
 
     //EPOCH
-    //global epoch field
     @Contended
-    static final class PaddedEpoch {
-        final AtomicLong value = new AtomicLong(0);
-    }
+    public final AtomicLong PRODUCER_PRE_TOUCH_EPOCH = new AtomicLong(0);
 
-    final PaddedEpoch GLOBAL_EPOCH = new PaddedEpoch();
+    private final int LOCAL_PRODUCER_PRE_TOUCH_SIZE;
+    @Contended
+    final AtomicLong CONSUMER_PRE_TOUCH_EPOCH = new AtomicLong(0);
+
     private final int RUNTIME_PROCESSOR_COUNT;
-    private final PaddedLong[] GLOBAL_EPOCH_TABLE;
+    //Epoch Based Reclamation
+    @Contended
+    private final long[] CONSUMER_EPOCH_TABLE;
+    //flow control
+    @Contended
+    private final long[] PRODUCER_EPOCH_TABLE;
 
-    private int getThreadSlot() {
-        int id = System.identityHashCode(Thread.currentThread());
-        int slot = (id & (RUNTIME_PROCESSOR_COUNT - 1));
-        return slot;
-    }
-
-    private final int LocalBufferHolder_BATCH_SIZE;
-
-    static boolean bLessThanA(long a, long b) {
-        return (a - b) < 0;
-    }
-
-    //global min value smaller than real is ok
-    long getGlobalMinEpochApproch() {
+    //global min value smaller than real min is ok,will not recliam using segment
+    static long getGlobalMinUsingEpoch(long[] consumer, long[] producer) {
         long min = Long.MAX_VALUE;
-        for (PaddedLong e : GLOBAL_EPOCH_TABLE) {
-            long value = e.value;
-            if (bLessThanA(value, min)) {
-                min = value;
+        for (int cpu = 0; cpu < consumer.length; cpu += STRIDE) {
+            long e = (long) LONG_ARRAY_HANDLE.getAcquire(consumer, cpu);
+            if (e != 0 && e < min) {
+                min = e;
+            }
+        }
+        for (int cpu = 0; cpu < producer.length; cpu += STRIDE) {
+            long e = (long) LONG_ARRAY_HANDLE.getAcquire(producer, cpu);
+            if (e != 0 && e < min) {
+                min = e;
             }
         }
         return min;
     }
 
-    //todo reconstruct freelist data sturcture
+    long updatePublishEpoch() {
+        long max = Long.MIN_VALUE;
+        for (int cpu = 0; cpu < PRODUCER_EPOCH_TABLE.length; cpu += STRIDE) {
+            long e = (long) LONG_ARRAY_HANDLE.getAcquire(PRODUCER_EPOCH_TABLE, cpu);
+            if (e != 0 && e > max) {
+                max = e;
+            }
+        }
+        return Math.clamp(max, 0, Long.MAX_VALUE);
+    }
+
+    private void updateProducerEpochMonotonic(int index, long newSeq) {
+        // 循环 CAS，确保只有当新值大于旧值时才更新
+        long current = (long) LONG_ARRAY_HANDLE.getAcquire(PRODUCER_EPOCH_TABLE, index);
+        while (newSeq > current) {
+            if (LONG_ARRAY_HANDLE.compareAndSet(PRODUCER_EPOCH_TABLE, index, current, newSeq)) {
+                return;
+            }
+            current = (long) LONG_ARRAY_HANDLE.getAcquire(PRODUCER_EPOCH_TABLE, index);
+        }
+    }
+
+    @Contended
     private final MPSCRingBuffer<Segment<E>> freeList;
+    @Contended
     private final MPSCRingBuffer<Segment<E>> retiredList;
 
-    //consumer reclaim control
+    //reclaim control
     //appromix op number is ok
     private long globalOpCounterLazy = 0L;
     private final long reclaimThresholdMask;
-    private final int maxReclaimPerRun;
+    private static final int MAX_RECLAIM_PER_RUN = 32;
 
     //local retired buffer
     private static final int LOCAL_RETIRED_CAPACITY = 8;
-    private final ScopedValue<LocalBufferHolder<E>> LOCAL_BUFFER;
+    private final ThreadLocal<LocalBufferHolder<E>> LOCAL_BUFFER;
+
+    private final Cleaner CLEANER = Cleaner.create();
 
     //queue filed
-    //todo how to reduce head and tail cas frequency
+    @Contended
     final AtomicReference<Segment<E>> head;
+    @Contended
     final AtomicReference<Segment<E>> tail;
 
-    static final class LocalBufferHolder<E> {
-        Segment<E> head;
-        Segment<E> tail;
+    static final class LocalBufferHolder<E> implements Runnable {
+        final int threadSlot;
+
+        Segment<E> localHead;
+        Segment<E> localTail;
 
         final Segment<E>[] retiredList;
-        final Segment<E>[] freshMono;
         int size;
+        final Segment<E>[] freshMono;
 
-        long epoch;
-        long base;
-        long limit;
+        long localConsumerCursor;
+        long takeLimit;
+        //local producer cursor
+        long localPublish;
+        long putLimit;
+
+        final long[] CONSUMER_TABLE;
+        final long[] PRODUCER_TABLE;
+        final MPSCRingBuffer<Segment<E>> globalRetiredList;
 
         @SuppressWarnings("unchecked")
-        LocalBufferHolder(int capacity, Segment<E> head, Segment<E> tail) {
+        LocalBufferHolder(int capacity, Segment<E> head, Segment<E> tail, int cpus,
+                          long[] consumerTable, long[] producerTable,
+                          MPSCRingBuffer<Segment<E>> globalRetiredList) {
             retiredList = new Segment[capacity];
             freshMono = new Segment[1];
-            this.head = head;
-            this.tail = tail;
+            this.localHead = head;
+            this.localTail = tail;
+            int localThreadId = System.identityHashCode(Thread.currentThread());
+            this.threadSlot = (localThreadId & Integer.MAX_VALUE) % cpus * STRIDE;
+            this.CONSUMER_TABLE = consumerTable;
+            this.PRODUCER_TABLE = producerTable;
+            this.globalRetiredList = globalRetiredList;
         }
 
-        void addRetired(Segment<E> segment, long localEpoch) {
-            segment.epoch = localEpoch;
+        void addRetired(Segment<E> segment) {
             retiredList[size++] = segment;
         }
 
@@ -231,8 +273,12 @@ public class MPMCLockFreeUnboundedQueue<E> {
             freshMono[0] = segment;
         }
 
-        Segment<E> getMono() {
+        Segment<E> getMono(long newBase) {
             Segment<E> value = freshMono[0];
+            if (value == null) {
+                return null;
+            }
+            value.lazyReset(newBase);
             freshMono[0] = null;
             return value;
         }
@@ -241,58 +287,105 @@ public class MPMCLockFreeUnboundedQueue<E> {
             return freshMono[0];
         }
 
+        void removeMono() {
+            if (freshMono == null) {
+                return;
+            }
+            freshMono[0].next.setPlain(null);
+            freshMono[0] = null;
+        }
+
         boolean isFull() {
             return size >= retiredList.length;
         }
+
+        @Override
+        public void run() {
+            // 线程退出时，将自己在消费者表中的记录设为 MAX，避免阻碍回收
+            LONG_ARRAY_HANDLE.setRelease(CONSUMER_TABLE, threadSlot, Long.MAX_VALUE);
+            //reclaim to global
+            long minInuse = getGlobalMinUsingEpoch(CONSUMER_TABLE, PRODUCER_TABLE);
+            for (int i = size; i >= 0; i--) {
+                Segment<E> seg = retiredList[i];
+                if (seg != null && seg.epoch < minInuse) {
+                    retiredList[i] = null;
+                    seg.next.setPlain(null);
+                    globalRetiredList.offer(seg);
+                }
+            }
+            Segment<E> mono = peekMono();
+            if (mono != null && mono.epoch < minInuse) {
+                removeMono();
+                globalRetiredList.offer(mono);
+            }
+            VarHandle.releaseFence();
+            //clear all didnt reclaim local segment again
+            for (int i = 0; i < retiredList.length; i++) {
+                Segment<E> seg = retiredList[i];
+                if (seg != null) {
+                    seg.next.setPlain(null);
+                }
+                retiredList[i] = null;
+            }
+            size = 0;
+            Segment<E> seg = freshMono[0];
+            if (seg != null) {
+                seg.next.setPlain(null);
+            }
+            freshMono[0] = null;
+        }
     }
 
-    private void retireSegment(Segment<E> seg) {
+    private void retireSegment(Segment<E> seg, LocalBufferHolder<E> buf) {
         // 优先放到本地 retired 缓冲，批量 flush 到全局
-        addRetiredToLocal(seg);
+        addRetiredToLocal(seg, buf);
     }
 
     // 将本地 retired 缓冲 flush 到全局 retiredPool
-    private void flushLocalRetired() {
-        LocalBufferHolder<E> buf = LOCAL_BUFFER.get();
+    private void flushLocalRetired(LocalBufferHolder<E> buf) {
         int c = buf.size;
-        if (c == 0) {
-            return;
-        }
+        if (c == 0) return;
+
         for (int i = 0; i < c; i++) {
             Segment<E> re = buf.retiredList[i];
             retiredList.offer(re);
             buf.retiredList[i] = null;
         }
         buf.size = 0;
+        VarHandle.releaseFence();
     }
 
-    private void addRetiredToLocal(Segment<E> s) {
-        LocalBufferHolder<E> buf = LOCAL_BUFFER.get();
-        long epoch = buf.epoch;
-        buf.addRetired(s, epoch);
+    private void addRetiredToLocal(Segment<E> s, LocalBufferHolder<E> buf) {
         if (buf.isFull()) {
-            flushLocalRetired();
+            flushLocalRetired(buf);
+        } else {
+            buf.addRetired(s);
         }
     }
 
     private void tryReclaim() {
         long op = globalOpCounterLazy++;
-        if ((op & reclaimThresholdMask) != 0) {
-            return; // not thredshold yet
-        }
+        // not thredshold yet
+        if ((op & reclaimThresholdMask) != 0) return;
         reclaimBatch();
     }
 
     private void reclaimBatch() {
-        long minInuse = getGlobalMinEpochApproch();
+        LocalBufferHolder<E> buf = LOCAL_BUFFER.get();
+        long minInuse = getGlobalMinUsingEpoch(CONSUMER_EPOCH_TABLE, PRODUCER_EPOCH_TABLE);
         int reclaimed = 0;
         Segment<E> rs;
-        while (reclaimed < maxReclaimPerRun
-                && (rs = retiredList.poll()) != null
-                && rs.epoch < minInuse) {
-            rs.baseSeq = 0;
+        while (reclaimed < MAX_RECLAIM_PER_RUN
+                && (rs = retiredList.peek()) != null) {
+            // 标准 EBR 检查：只有当 segment 的 epoch 小于全局最小 active epoch 时才回收
+            // 还没到安全回收的时候,retiredList 应该是有序的，如果头都不能回收，后面的也不能
+            if (rs.epoch >= minInuse) break;
+
+            rs = retiredList.poll(buf.localPublish + 1);
+            // 还没到安全回收的时候,retiredList 应该是有序的，如果头都不能回收，后面的也不能
+            if (rs == null) break;
+
             rs.next.setPlain(null);
-            LocalBufferHolder<E> buf = LOCAL_BUFFER.get();
             //case 1 add local mono
             if (buf.peekMono() == null) {
                 buf.addMono(rs);
@@ -302,29 +395,37 @@ public class MPMCLockFreeUnboundedQueue<E> {
             }
             reclaimed++;
         }
+        VarHandle.releaseFence();
     }
 
     public MPMCLockFreeUnboundedQueue() {
         RUNTIME_PROCESSOR_COUNT = Runtime.getRuntime().availableProcessors();
-        GLOBAL_EPOCH_TABLE = new PaddedLong[RUNTIME_PROCESSOR_COUNT];
-        Arrays.fill(GLOBAL_EPOCH_TABLE, new PaddedLong(Long.MAX_VALUE));
-        LOCAL_BUFFER = ScopedValue.newInstance();
-        freeList = new MPSCRingBuffer<>(1024);
-        retiredList = new MPSCRingBuffer<>(1024);
-        Segment<E> first = new Segment<>(SEGMENT_CAPACITY, 0);
+        CONSUMER_EPOCH_TABLE = new long[RUNTIME_PROCESSOR_COUNT * STRIDE];
+        PRODUCER_EPOCH_TABLE = new long[RUNTIME_PROCESSOR_COUNT * STRIDE];
+
+        Segment<E> first = new Segment<>(0);
         head = new AtomicReference<>(first);
         tail = new AtomicReference<>(first);
+        freeList = new MPSCRingBuffer<>(1024);
+        retiredList = new MPSCRingBuffer<>(1024);
+        LOCAL_BUFFER = ThreadLocal.withInitial(() -> {
+            LocalBufferHolder<E> holder = new LocalBufferHolder<>(
+                    LOCAL_RETIRED_CAPACITY,
+                    head.getAcquire(),
+                    tail.getAcquire(),
+                    RUNTIME_PROCESSOR_COUNT,
+                    CONSUMER_EPOCH_TABLE,
+                    PRODUCER_EPOCH_TABLE,
+                    retiredList
+            );
+            CLEANER.register(Thread.currentThread(), holder);
+            return holder;
+        });
 
 
-        long reclaimThreshold = 1024;
+        long reclaimThreshold = 2048;
         this.reclaimThresholdMask = reclaimThreshold - 1;
-        this.LocalBufferHolder_BATCH_SIZE = 64;
-        this.maxReclaimPerRun = 32;
-
-        //warm up
-        for (int i = 0; i < 16; i++) {
-            freeList.offer(new Segment<>(SEGMENT_CAPACITY, 0));
-        }
+        this.LOCAL_PRODUCER_PRE_TOUCH_SIZE = 64;
     }
 
     private static void backOff(int count) {
@@ -335,217 +436,183 @@ public class MPMCLockFreeUnboundedQueue<E> {
         }
         //exponential backoff
         int shift = Math.min(count, 20);
-        long delay = (1L << Math.min(count,20)) + ThreadLocalRandom.current().nextLong(50);
+        long delay = (1L << shift) + ThreadLocalRandom.current().nextLong(50);
         LockSupport.parkNanos(delay);
     }
 
-    private Segment<E> locateSegmentForPut(int count) {
-        LocalBufferHolder<E> local = LOCAL_BUFFER.get();
-        int readCount = 0;
+    private Segment<E> locateSegmentForPut(int count, LocalBufferHolder<E> local) {
         while (true) {
-            Segment<E> curTail = local.tail;
-            long seq = local.epoch;
-            long limit = local.limit;
+            Segment<E> curTail = local.localTail;
+            long seq = local.localPublish + 1;
+            //check bound
+            if (curTail.ownsSeq(seq)) return curTail;
 
-            if (curTail.ownsSeq(seq)) {
-                return curTail;
-            } else {
-                if (readCount++ > 3) {
-                    curTail = this.tail.getAcquire();
-                    local.tail = curTail;
-                    local.head = this.head.getAcquire();
+            long newBase = curTail.baseSeq + SEGMENT_CAPACITY;
+            //seq > newBase,need new segment
+            if (seq >= newBase) {
+                //case0 get next until real tail
+                Segment<E> newTail = curTail.next.getAcquire();
+                while (newTail != null) {
+                    if (this.tail.compareAndSet(curTail, newTail)) {
+                        local.localTail = newTail;
+                        break;
+                    }
+                    newTail = curTail.next.getAcquire();
                 }
-            }
-
-            if (seq >= limit) {
-                Segment<E> next = curTail.next.getAcquire();
-                if (next != null) {
-                    this.tail.compareAndSet(curTail, next);
-                    continue;
-                }
-                LocalBufferHolder<E> buffer = LOCAL_BUFFER.get();
-                long newBase  = ((seq / SEGMENT_CAPACITY) * SEGMENT_CAPACITY);
                 //case1 get thread local mono
-                Segment<E> newTail = buffer.getMono();
-                if (newTail == null) {
-                    //case2 get global free list
-                    newTail = freeList.poll();
-                }
-                if (newTail != null) {
-                    //lazy reset
-                    newTail.lazyReset(newBase, seq);
-                }
+                if (newTail == null) newTail = local.getMono(newBase);
+                //case2 get global free list
+                if (newTail == null) newTail = freeList.poll(newBase);
                 //case3 construct new segment
-                if (newTail == null) {
-                    newTail = new Segment<>(newBase, seq);
-                }
+                if (newTail == null) newTail = new Segment<>(newBase);
+                //update tail
                 if (curTail.next.compareAndSet(null, newTail)) {
                     this.tail.compareAndSet(curTail, newTail);
-                    return newTail;
-                } else {
-                    backOff(++count);
+                    local.localTail = newTail;
                 }
-            } else {
-                backOff(++count);
+                //check bounded again
+                if (curTail.ownsSeq(seq)) return curTail;
             }
+            backOff(++count);
         }
     }
 
-
-    private Segment<E> locateSegmentForTake(int count) {
-        LocalBufferHolder<E> local = LOCAL_BUFFER.get();
+    private Segment<E> locateSegmentForTake(int count, LocalBufferHolder<E> local) {
         while (true) {
-            Segment<E> currentHead = local.head;
-            long seq = local.epoch;
-            long limit = local.limit;
+            Segment<E> currentHead = local.localHead;
+            long seq = local.localConsumerCursor + 1;
+
             if (currentHead.ownsSeq(seq)) {
                 return currentHead;
-            } else {
-                currentHead = this.head.getAcquire();
-                local.head = currentHead;
-                local.tail = this.tail.getAcquire();
             }
-            if (seq >= limit) {
+            currentHead = this.head.getAcquire();
+            local.localHead = currentHead;
+            local.localTail = this.tail.getAcquire();
+            if (currentHead.ownsSeq(seq)) {
+                return currentHead;
+            }
+            //find next
+            if (seq >= currentHead.baseSeq + SEGMENT_CAPACITY) {
                 Segment<E> next = currentHead.next.getAcquire();
                 if (next == null) {
                     return null;
                 }
                 if (this.head.compareAndSet(currentHead, next)) {
-                    retireSegment(currentHead);
-                } else {
-                    backOff(++count);
+                    retireSegment(currentHead, local);
                 }
-            } else {
-                backOff(++count);
+                //access concurrent update local head
+                local.localHead = next;
             }
+            backOff(++count);
         }
     }
 
     //Vyukov-style: sequence-based，0 slot CAS
     public void offer(E value) {
         Objects.requireNonNull(value);
-        LocalBufferHolder<E> buf = LOCAL_BUFFER.orElse(null);
+        LocalBufferHolder<E> local = LOCAL_BUFFER.get();
+        if (local.localPublish + 1 >= local.putLimit) {
+            //batch incr local producer cursor
+            long newBase = PRODUCER_PRE_TOUCH_EPOCH.getAndAdd(LOCAL_PRODUCER_PRE_TOUCH_SIZE);
+            local.putLimit = newBase + LOCAL_PRODUCER_PRE_TOUCH_SIZE;
+            local.localPublish = newBase - 1;
+        }
+        long seq = local.localPublish + 1;
+
+        int count = 0;
         try {
-            if (buf == null) {
-                buf = new LocalBufferHolder<>(LOCAL_RETIRED_CAPACITY, head.getAcquire(), tail.getAcquire());
-                ScopedValue.where(LOCAL_BUFFER, buf)
-                        .run(() -> doPut(value));
-            } else {
-                doPut(value);
+            while (true) {
+                Segment<E> newTail = locateSegmentForPut(count, local);
+
+                int slot = (int) (seq & SEGMENT_MASK) * STRIDE;
+                long observed = (long) LONG_ARRAY_HANDLE.getAcquire(newTail.sequences, slot);
+                if (seq == observed) {
+                    OBJECT_ARRAY_HANDLE.setOpaque(newTail.items, slot, value);
+                    VarHandle.storeStoreFence();
+                    LONG_ARRAY_HANDLE.setRelease(newTail.sequences, slot, seq + 1);
+                    //update global epoch table,
+                    // notify reclaim this seq is using
+                    //notify consumer this seq putted
+                    updateProducerEpochMonotonic(local.threadSlot, seq + 1);
+                    local.localPublish = seq;
+                    return;
+                }
+                backOff(++count);
             }
         } finally {
             // batched reclaim trigger
-            long ops = globalOpCounterLazy++;
+            long ops = globalOpCounterLazy;
             if ((ops & reclaimThresholdMask) == 0) {
                 tryReclaim();
             }
         }
     }
 
-    private void doPut(E value) {
+    //Vyukov-style: sequence-based，0 slot CAS
+    public E poll() {
         LocalBufferHolder<E> local = LOCAL_BUFFER.get();
         int count = 0;
-        while (true) {
-            if (local.base >= local.limit) {
-                //batch get seq
-                long newBase = GLOBAL_EPOCH.value.getAndAdd(LocalBufferHolder_BATCH_SIZE);
-                local.base = newBase;
-                local.limit = newBase + LocalBufferHolder_BATCH_SIZE;
-            }
-
-            long seq = local.base++;
-            local.epoch = seq;
-            //update global epoch table
-            int threadSlot = getThreadSlot();
-            GLOBAL_EPOCH_TABLE[threadSlot].value = seq;
-            int finalCount = count;
-            Segment<E> newTail = locateSegmentForPut(finalCount);
-
-            int slot = (int) (seq & SEGMENT_MASK);
-            long observed = newTail.sequences[slot * STRIDE];
-            if (seq == observed) {
-                OBJECT_VARHANDLE.setRelease(newTail.items[slot], value);
-                VarHandle.releaseFence();
-                newTail.sequences[slot * STRIDE] = seq + 1L;
-                return;
-            }
-            if (observed < newTail.baseSeq) {
-                //lazy clean,retry write
-                newTail.items[slot].value = null;
-                newTail.sequences[slot * STRIDE] = seq;
-                continue;
-            }
-            backOff(++count);
-        }
-    }
-
-
-    public E poll() {
-        LocalBufferHolder<E> buf = LOCAL_BUFFER.orElse(null);
         try {
-            if (buf == null) {
-                buf = new LocalBufferHolder<>(LOCAL_RETIRED_CAPACITY, head.getAcquire(), tail.getAcquire());
-                return ScopedValue.where(LOCAL_BUFFER, buf)
-                        .call(this::doTake);
-            } else {
-                return doTake();
+            //acquire batch consumer limit
+            if (local.localConsumerCursor + 1 >= local.takeLimit) {
+                while (true) {
+                    long consumerEpoch = CONSUMER_PRE_TOUCH_EPOCH.getAcquire();
+                    long producerEpoch = updatePublishEpoch();
+
+                    if (producerEpoch == consumerEpoch) {
+                        return null;
+                    }
+                    // 只能申请到生产者已经推进到的位置
+                    long batch = Math.clamp(producerEpoch - consumerEpoch, 0, LOCAL_PRODUCER_PRE_TOUCH_SIZE);
+                    //no element can take ,waiting producer
+                    if (batch > 0) {
+                        //try acquire consumer pre touch batch
+                        if (CONSUMER_PRE_TOUCH_EPOCH.compareAndSet(consumerEpoch, consumerEpoch + batch)) {
+                            local.localConsumerCursor = consumerEpoch - 1;
+                            local.takeLimit = consumerEpoch + batch;
+                            break;
+                        }
+                    }
+                    backOff(++count);
+                }
+            }
+
+            while (true) {
+                long seq = local.localConsumerCursor + 1;
+                Segment<E> currentHead = locateSegmentForTake(count, local);
+                //consumer spin waiting producer link new head
+                if (currentHead == null) {
+                    backOff(++count);
+                    continue;
+                }
+
+                int slot = (int) (seq & SEGMENT_MASK) * STRIDE;
+                long observe = (long) LONG_ARRAY_HANDLE.getAcquire(currentHead.sequences, slot);
+
+                if (observe == seq + 1L) {
+                    @SuppressWarnings("unchecked")
+                    E value = (E) OBJECT_ARRAY_HANDLE.getOpaque(currentHead.items, slot);
+                    if (value != null &&
+                            OBJECT_ARRAY_HANDLE.compareAndSet(currentHead.items, slot, value, null)) {
+                        local.localConsumerCursor = seq;
+                        LONG_ARRAY_HANDLE.setRelease(currentHead.sequences, slot, seq + SEGMENT_CAPACITY);
+                        VarHandle.storeStoreFence();
+                        LONG_ARRAY_HANDLE.setRelease(CONSUMER_EPOCH_TABLE, local.threadSlot, seq + 1);
+                        return value;
+                    }
+                }
+                //queue empty
+                if (observe < seq && currentHead.next.getOpaque() == null) return null;
+                //if race happen.spin
+                backOff(++count);
             }
         } finally {
             long ops = globalOpCounterLazy++;
             if ((ops & reclaimThresholdMask) == 0) {
                 tryReclaim();
-            }
-        }
-    }
-
-    private E doTake() {
-        LocalBufferHolder<E> local = LOCAL_BUFFER.get();
-        int count = 0;
-        while (true) {
-            if (local.base >= local.limit) {
-                //batch get seq
-                long newBase = GLOBAL_EPOCH.value.getAndAdd(LocalBufferHolder_BATCH_SIZE);
-                local.base = newBase;
-                local.limit = newBase + LocalBufferHolder_BATCH_SIZE;
-            }
-
-            long seq = local.base++;
-            local.epoch = seq;
-            //update global epoch table
-            int threadSlot = getThreadSlot();
-            GLOBAL_EPOCH_TABLE[threadSlot].value = seq;
-            int finalCount = count;
-            Segment<E> currentHead = locateSegmentForTake(finalCount);
-            Segment<E> localHead = local.head;
-            Segment<E> localTail = local.tail;
-            //double check,fast return null
-            if (currentHead == null) {
-                if (localHead == localTail) {
-                    return null; // Queue is truly empty
-                }
-                //consumer spin waiting producer
-                backOff(count++);
-                continue;
-            }
-
-            int slot = (int) (seq & SEGMENT_MASK);
-            long observe = currentHead.sequences[slot * STRIDE];
-            long expected = seq + 1L;
-            if (observe == expected) {
-                PaddedObject cell = currentHead.items[slot];
-                @SuppressWarnings("unchecked")
-                E value = (E) OBJECT_VARHANDLE.getAcquire(cell);
-                OBJECT_VARHANDLE.setRelease(cell, null);
-                VarHandle.releaseFence();
-                currentHead.sequences[slot * STRIDE] = seq + SEGMENT_CAPACITY;
-                return value;
-            } else if (observe < currentHead.baseSeq) {
-                //stale slot.skip
-                return null;
-            } else {
-                backOff(count++);
             }
         }
     }
 
 }
+
