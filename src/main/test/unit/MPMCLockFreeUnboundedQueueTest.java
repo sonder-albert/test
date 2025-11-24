@@ -28,7 +28,7 @@ class MPMCLockFreeUnboundedQueueTest {
     }
 
     // 基本并发性：多生产者多消费者，确保没有丢失
-    //@RepeatedTest(5)
+    @RepeatedTest(5)
     void testConcurrentPutPollManyProducersConsumers() throws InterruptedException {
         q=null;
         q = new MPMCLockFreeUnboundedQueue<>();
@@ -91,7 +91,7 @@ class MPMCLockFreeUnboundedQueueTest {
         for (Long v : consumed) {
             assertTrue(prodList.remove(v), "消费的值应来自生产者，且不多次消费");
         }
-        System.out.println("epoch=" + q.PRODUCER_PRE_TOUCH_EPOCH.get());
+        System.out.println("epoch=" + q.updatePublishEpoch());
         q = null;
 
     }

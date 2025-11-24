@@ -7,6 +7,7 @@ import java.lang.invoke.VarHandle;
 import java.lang.ref.Cleaner;
 import java.util.Objects;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
@@ -44,6 +45,7 @@ public class MPMCLockFreeUnboundedQueue<E> {
         volatile long baseSeq;
         final int capacity;
         volatile long epoch;
+        final AtomicInteger consumed = new AtomicInteger(0);
 
         @SuppressWarnings("unchecked")
         Segment(long baseSeq) {
@@ -63,15 +65,18 @@ public class MPMCLockFreeUnboundedQueue<E> {
             return seq >= baseSeq && seq < baseSeq + capacity;
         }
 
-        public void lazyReset(long newBase) {
+        public void reset(long newBase) {
             this.baseSeq = newBase;
-            this.next.setRelease(null);
-            int slot = (int) (newBase & SEGMENT_MASK);
-            this.sequences[slot * STRIDE] = newBase;
-            this.items[slot] = null;
+            this.epoch = 0;
             VarHandle.releaseFence();
+            this.next.setRelease(null);
+            for (int i = 0; i < capacity; i++) {
+                LONG_ARRAY_HANDLE.setRelease(sequences, i * STRIDE, baseSeq + i);
+            }
+            for (int i = 0; i < capacity; i++) {
+                OBJECT_ARRAY_HANDLE.setRelease(items, i * STRIDE, null);
+            }
         }
-
     }
 
     static final class MPSCRingBuffer<E> {
@@ -100,50 +105,45 @@ public class MPMCLockFreeUnboundedQueue<E> {
         }
 
         E poll(long seq) {
-            long p = (long) P_INDEX.getOpaque(this);
-            long c = (long) C_INDEX.getOpaque(this);
+            long p = (long) P_INDEX.getAcquire(this);
+            long c = (long) C_INDEX.getAcquire(this);
             if (c >= p) {
                 return null;
             }
-            int slot = (int) (p & mask);
-            VarHandle.acquireFence();
-            Segment<E> e = (Segment<E>) buffer[slot];
+            int slot = (int) (c & mask);
+            @SuppressWarnings("unchecked")
+            Segment<E> e = (Segment<E>) OBJECT_ARRAY_HANDLE.getAcquire(buffer, slot);
             if (e == null) {
                 return null;
             }
-            e.lazyReset(seq);
-            buffer[slot] = null;
-            VarHandle.releaseFence();
+            e.reset(seq);
+            OBJECT_ARRAY_HANDLE.setRelease(buffer, slot, null);
             C_INDEX.setRelease(this, c + 1);
             return (E) e;
         }
 
         E peek() {
-            long p = (long) P_INDEX.getOpaque(this);
-            long c = (long) C_INDEX.getOpaque(this);
+            long p = (long) P_INDEX.getAcquire(this);
+            long c = (long) C_INDEX.getAcquire(this);
             if (c >= p) {
                 return null;
             }
-            int slot = (int) (p & mask);
-            VarHandle.acquireFence();
-            Segment<E> e = (Segment<E>) buffer[slot];
-            if (e == null) {
-                return null;
-            }
-            return (E) e;
+            int slot = (int) (c & mask);
+            @SuppressWarnings("unchecked")
+            E e = (E) OBJECT_ARRAY_HANDLE.getAcquire(buffer, slot);
+            return e;
         }
 
         public void offer(E e) {
             while (true) {
-                long p = (long) P_INDEX.getOpaque(this);
-                long c = (long) C_INDEX.getOpaque(this);
+                long p = (long) P_INDEX.getAcquire(this);
+                long c = (long) C_INDEX.getAcquire(this);
                 if (p - c >= buffer.length) {
                     return;
                 }
                 if (P_INDEX.compareAndSet(this, p, p + 1)) {
                     int slot = (int) (p & mask);
-                    VarHandle.releaseFence();
-                    buffer[slot] = e;
+                    OBJECT_ARRAY_HANDLE.setRelease(buffer, slot, e);
                     return;
                 }
                 Thread.onSpinWait();
@@ -185,17 +185,25 @@ public class MPMCLockFreeUnboundedQueue<E> {
         return min;
     }
 
-    long updatePublishEpoch() {
+    public long updatePublishEpoch() {
         long max = Long.MIN_VALUE;
         for (int cpu = 0; cpu < PRODUCER_EPOCH_TABLE.length; cpu += STRIDE) {
             long e = (long) LONG_ARRAY_HANDLE.getAcquire(PRODUCER_EPOCH_TABLE, cpu);
-            if (e != 0 && e > max) {
+            if (e != 0 && e != Long.MAX_VALUE && e > max) {
                 max = e;
             }
         }
-        return Math.clamp(max, 0, Long.MAX_VALUE);
+        return Math.clamp(max, 0, Long.MAX_VALUE - 1);
     }
 
+    /**
+     * update global epoch table,
+     * notify reclaim this seq is using
+     * notify consumer this seq putted
+     *
+     * @param index  of sequence
+     * @param newSeq new value of sequence[index]
+     */
     private void updateProducerEpochMonotonic(int index, long newSeq) {
         // 循环 CAS，确保只有当新值大于旧值时才更新
         long current = (long) LONG_ARRAY_HANDLE.getAcquire(PRODUCER_EPOCH_TABLE, index);
@@ -214,10 +222,9 @@ public class MPMCLockFreeUnboundedQueue<E> {
 
     //reclaim control
     //appromix op number is ok
-    private long globalOpCounterLazy = 0L;
     private final long reclaimThresholdMask;
     private static final int MAX_RECLAIM_PER_RUN = 32;
-
+    private final AtomicInteger reclaimCounter = new AtomicInteger(0);
     //local retired buffer
     private static final int LOCAL_RETIRED_CAPACITY = 8;
     private final ThreadLocal<LocalBufferHolder<E>> LOCAL_BUFFER;
@@ -263,6 +270,9 @@ public class MPMCLockFreeUnboundedQueue<E> {
             this.CONSUMER_TABLE = consumerTable;
             this.PRODUCER_TABLE = producerTable;
             this.globalRetiredList = globalRetiredList;
+            // 【关键修复】显式初始化为 -1，避免默认 0 导致跳过第 0 个元素
+            this.localConsumerCursor = -1;
+            this.localPublish = -1;
         }
 
         void addRetired(Segment<E> segment) {
@@ -278,7 +288,7 @@ public class MPMCLockFreeUnboundedQueue<E> {
             if (value == null) {
                 return null;
             }
-            value.lazyReset(newBase);
+            value.reset(newBase);
             freshMono[0] = null;
             return value;
         }
@@ -291,7 +301,7 @@ public class MPMCLockFreeUnboundedQueue<E> {
             if (freshMono == null) {
                 return;
             }
-            freshMono[0].next.setPlain(null);
+            freshMono[0].next.setRelease(null);
             freshMono[0] = null;
         }
 
@@ -311,7 +321,7 @@ public class MPMCLockFreeUnboundedQueue<E> {
                 Segment<E> seg = retiredList[i];
                 if (seg != null && seg.epoch < minInuse) {
                     retiredList[i] = null;
-                    seg.next.setPlain(null);
+                    seg.next.setRelease(null);
                     globalRetiredList.offer(seg);
                 }
             }
@@ -325,14 +335,14 @@ public class MPMCLockFreeUnboundedQueue<E> {
             for (int i = 0; i < retiredList.length; i++) {
                 Segment<E> seg = retiredList[i];
                 if (seg != null) {
-                    seg.next.setPlain(null);
+                    seg.next.setRelease(null);
                 }
                 retiredList[i] = null;
             }
             size = 0;
             Segment<E> seg = freshMono[0];
             if (seg != null) {
-                seg.next.setPlain(null);
+                seg.next.setRelease(null);
             }
             freshMono[0] = null;
         }
@@ -360,15 +370,13 @@ public class MPMCLockFreeUnboundedQueue<E> {
     private void addRetiredToLocal(Segment<E> s, LocalBufferHolder<E> buf) {
         if (buf.isFull()) {
             flushLocalRetired(buf);
+            tryReclaim();
         } else {
             buf.addRetired(s);
         }
     }
 
     private void tryReclaim() {
-        long op = globalOpCounterLazy++;
-        // not thredshold yet
-        if ((op & reclaimThresholdMask) != 0) return;
         reclaimBatch();
     }
 
@@ -382,12 +390,13 @@ public class MPMCLockFreeUnboundedQueue<E> {
             // 标准 EBR 检查：只有当 segment 的 epoch 小于全局最小 active epoch 时才回收
             // 还没到安全回收的时候,retiredList 应该是有序的，如果头都不能回收，后面的也不能
             if (rs.epoch >= minInuse) break;
-
+            //check segment whether all consumed
+            if (rs.consumed.getAcquire() < SEGMENT_CAPACITY) break;
             rs = retiredList.poll(buf.localPublish + 1);
             // 还没到安全回收的时候,retiredList 应该是有序的，如果头都不能回收，后面的也不能
             if (rs == null) break;
 
-            rs.next.setPlain(null);
+            rs.next.setOpaque(null);
             //case 1 add local mono
             if (buf.peekMono() == null) {
                 buf.addMono(rs);
@@ -445,7 +454,8 @@ public class MPMCLockFreeUnboundedQueue<E> {
     private Segment<E> locateSegmentForPut(int count, LocalBufferHolder<E> local) {
         while (true) {
             Segment<E> curTail = local.localTail;
-            long seq = local.localPublish + 1;
+
+            long seq = local.localPublish;
             //check bound
             if (curTail.ownsSeq(seq)) return curTail;
 
@@ -489,7 +499,6 @@ public class MPMCLockFreeUnboundedQueue<E> {
             }
             currentHead = this.head.getAcquire();
             local.localHead = currentHead;
-            local.localTail = this.tail.getAcquire();
             if (currentHead.ownsSeq(seq)) {
                 return currentHead;
             }
@@ -499,11 +508,12 @@ public class MPMCLockFreeUnboundedQueue<E> {
                 if (next == null) {
                     return null;
                 }
-                if (this.head.compareAndSet(currentHead, next)) {
+                //promise current segment all slot consumed
+                if (currentHead.consumed.getAcquire() == SEGMENT_CAPACITY && this.head.compareAndSet(currentHead, next)) {
                     retireSegment(currentHead, local);
+                    local.localHead = next;
+                    return next;
                 }
-                //access concurrent update local head
-                local.localHead = next;
             }
             backOff(++count);
         }
@@ -518,102 +528,86 @@ public class MPMCLockFreeUnboundedQueue<E> {
             long newBase = PRODUCER_PRE_TOUCH_EPOCH.getAndAdd(LOCAL_PRODUCER_PRE_TOUCH_SIZE);
             local.putLimit = newBase + LOCAL_PRODUCER_PRE_TOUCH_SIZE;
             local.localPublish = newBase - 1;
+            VarHandle.releaseFence();
         }
         long seq = local.localPublish + 1;
-
+        local.localPublish = seq;
+        VarHandle.releaseFence();
         int count = 0;
-        try {
-            while (true) {
-                Segment<E> newTail = locateSegmentForPut(count, local);
 
-                int slot = (int) (seq & SEGMENT_MASK) * STRIDE;
-                long observed = (long) LONG_ARRAY_HANDLE.getAcquire(newTail.sequences, slot);
-                if (seq == observed) {
-                    OBJECT_ARRAY_HANDLE.setOpaque(newTail.items, slot, value);
-                    VarHandle.storeStoreFence();
-                    LONG_ARRAY_HANDLE.setRelease(newTail.sequences, slot, seq + 1);
-                    //update global epoch table,
-                    // notify reclaim this seq is using
-                    //notify consumer this seq putted
-                    updateProducerEpochMonotonic(local.threadSlot, seq + 1);
-                    local.localPublish = seq;
-                    return;
-                }
-                backOff(++count);
+        while (true) {
+            Segment<E> newTail = locateSegmentForPut(count, local);
+
+            int slot = (int) (seq & SEGMENT_MASK) * STRIDE;
+            long observed = (long) LONG_ARRAY_HANDLE.getAcquire(newTail.sequences, slot);
+            if (seq == observed &&
+                    OBJECT_ARRAY_HANDLE.compareAndSet(newTail.items, slot, null, value)) {
+                LONG_ARRAY_HANDLE.setRelease(newTail.sequences, slot, seq + 1);
+                updateProducerEpochMonotonic(local.threadSlot, seq + 1);
+                return;
             }
-        } finally {
-            // batched reclaim trigger
-            long ops = globalOpCounterLazy;
-            if ((ops & reclaimThresholdMask) == 0) {
-                tryReclaim();
-            }
+            backOff(++count);
         }
+
     }
 
     //Vyukov-style: sequence-based，0 slot CAS
     public E poll() {
         LocalBufferHolder<E> local = LOCAL_BUFFER.get();
         int count = 0;
-        try {
-            //acquire batch consumer limit
-            if (local.localConsumerCursor + 1 >= local.takeLimit) {
-                while (true) {
-                    long consumerEpoch = CONSUMER_PRE_TOUCH_EPOCH.getAcquire();
-                    long producerEpoch = updatePublishEpoch();
-                    //todo may happen fake empty?need jcstress test
-                    if (producerEpoch == consumerEpoch) {
-                        return null;
-                    }
-                    // 只能申请到生产者已经推进到的位置
-                    long batch = Math.clamp(producerEpoch - consumerEpoch, 0, LOCAL_PRODUCER_PRE_TOUCH_SIZE);
-                    //no element can take ,waiting producer
-                    if (batch > 0) {
-                        //try acquire consumer pre touch batch
-                        if (CONSUMER_PRE_TOUCH_EPOCH.compareAndSet(consumerEpoch, consumerEpoch + batch)) {
-                            local.localConsumerCursor = consumerEpoch - 1;
-                            local.takeLimit = consumerEpoch + batch;
-                            break;
-                        }
-                    }
-                    backOff(++count);
-                }
-            }
 
+        //acquire batch consumer limit
+        if (local.localConsumerCursor + 1 >= local.takeLimit) {
             while (true) {
-                long seq = local.localConsumerCursor + 1;
-                Segment<E> currentHead = locateSegmentForTake(count, local);
-                //consumer spin waiting producer link new head
-                if (currentHead == null) {
-                    backOff(++count);
-                    continue;
-                }
+                long consumerEpoch = CONSUMER_PRE_TOUCH_EPOCH.getAcquire();
+                long producerEpoch = updatePublishEpoch();
 
-                int slot = (int) (seq & SEGMENT_MASK) * STRIDE;
-                long observe = (long) LONG_ARRAY_HANDLE.getAcquire(currentHead.sequences, slot);
-
-                if (observe == seq + 1L) {
-                    @SuppressWarnings("unchecked")
-                    E value = (E) OBJECT_ARRAY_HANDLE.getOpaque(currentHead.items, slot);
-                    if (value != null &&
-                            OBJECT_ARRAY_HANDLE.compareAndSet(currentHead.items, slot, value, null)) {
-                        local.localConsumerCursor = seq;
-                        LONG_ARRAY_HANDLE.setRelease(currentHead.sequences, slot, seq + SEGMENT_CAPACITY);
-                        VarHandle.storeStoreFence();
-                        LONG_ARRAY_HANDLE.setRelease(CONSUMER_EPOCH_TABLE, local.threadSlot, seq + 1);
-                        return value;
-                    }
+                if (producerEpoch <= consumerEpoch) {
+                    return null;
                 }
-                //queue empty
-                if (observe < seq && currentHead.next.getOpaque() == null) return null;
-                //if race happen.spin
+                // 只能申请到生产者已经推进到的位置
+                long batch = Math.clamp(producerEpoch - consumerEpoch, 0, LOCAL_PRODUCER_PRE_TOUCH_SIZE);
+                //try acquire local batch size
+                if (batch > 0 && CONSUMER_PRE_TOUCH_EPOCH.compareAndSet(consumerEpoch, consumerEpoch + batch)) {
+                    local.takeLimit = consumerEpoch + batch;
+                    local.localConsumerCursor = consumerEpoch - 1;
+                    VarHandle.releaseFence();
+                    break;
+                }
+                //no element can take ,waiting producer
                 backOff(++count);
             }
-        } finally {
-            long ops = globalOpCounterLazy++;
-            if ((ops & reclaimThresholdMask) == 0) {
-                tryReclaim();
-            }
         }
+
+        while (true) {
+            long seq = local.localConsumerCursor + 1;
+            Segment<E> currentHead = locateSegmentForTake(count, local);
+            //consumer spin waiting producer link new head
+            if (currentHead == null) {
+                backOff(++count);
+                continue;
+            }
+
+            int slot = (int) (seq & SEGMENT_MASK) * STRIDE;
+            long observe = (long) LONG_ARRAY_HANDLE.getAcquire(currentHead.sequences, slot);
+
+            if (observe == seq + 1L) {
+                @SuppressWarnings("unchecked")
+                E value = (E) OBJECT_ARRAY_HANDLE.getAcquire(currentHead.items, slot);
+                if (value != null &&
+                        OBJECT_ARRAY_HANDLE.compareAndSet(currentHead.items, slot, value, null)) {
+                    LONG_ARRAY_HANDLE.setRelease(currentHead.sequences, slot, seq + SEGMENT_CAPACITY);
+                    LONG_ARRAY_HANDLE.setRelease(CONSUMER_EPOCH_TABLE, local.threadSlot, seq + 1);
+                    currentHead.consumed.incrementAndGet();
+                    local.localConsumerCursor = seq;
+                    return value;
+                }
+            }
+
+            //if race happen.spin
+            backOff(++count);
+        }
+
     }
 
 }
