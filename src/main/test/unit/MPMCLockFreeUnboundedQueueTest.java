@@ -91,7 +91,7 @@ class MPMCLockFreeUnboundedQueueTest {
         for (Long v : consumed) {
             assertTrue(prodList.remove(v), "消费的值应来自生产者，且不多次消费");
         }
-        System.out.println("epoch=" + q.updatePublishEpoch());
+//        System.out.println("epoch=" + q.updateGlobalPublish());
         q = null;
 
     }

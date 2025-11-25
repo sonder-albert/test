@@ -9,11 +9,11 @@
     <version>1.0-SNAPSHOT</version>
     <dependencies>
 
-<!--        <dependency>-->
-<!--            <groupId>org.jctools</groupId>-->
-<!--            <artifactId>jctools-core</artifactId>-->
-<!--            <version>4.0.3</version>-->
-<!--        </dependency>-->
+        <dependency>
+            <groupId>org.jctools</groupId>
+            <artifactId>jctools-core</artifactId>
+            <version>4.0.3</version>
+        </dependency>
 <!--        <dependency>-->
 <!--            <groupId>org.openjdk.jol</groupId>-->
 <!--            <artifactId>jol-core</artifactId>-->
@@ -39,16 +39,18 @@
             <scope>test</scope>
         </dependency>
 
-<!--        <dependency>-->
-<!--            <groupId>org.openjdk.jmh</groupId>-->
-<!--            <artifactId>jmh-core</artifactId>-->
-<!--            <version>1.37</version>-->
-<!--        </dependency>-->
-<!--        <dependency>-->
-<!--            <groupId>org.openjdk.jmh</groupId>-->
-<!--            <artifactId>jmh-generator-annprocess</artifactId>-->
-<!--            <version>1.37</version>-->
-<!--        </dependency>-->
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-core</artifactId>
+            <version>1.37</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-generator-annprocess</artifactId>
+            <version>1.37</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -61,13 +63,13 @@
                     <target>23</target>
                     <compilerArgs>--enable-preview</compilerArgs>
                     <!-- 关键修复：显式指定注解处理器路径 -->
-                    <annotationProcessorPaths>
-                        <path>
-                            <groupId>org.openjdk.jcstress</groupId>
-                            <artifactId>jcstress-core</artifactId>
-                            <version>0.16</version>
-                        </path>
-                    </annotationProcessorPaths>
+<!--                    <annotationProcessorPaths>-->
+<!--                        <path>-->
+<!--                            <groupId>org.openjdk.jcstress</groupId>-->
+<!--                            <artifactId>jcstress-core</artifactId>-->
+<!--                            <version>0.16</version>-->
+<!--                        </path>-->
+<!--                    </annotationProcessorPaths>-->
                 </configuration>
             </plugin>
             <!-- 必须：Shade 插件用于打包可执行 jar -->
