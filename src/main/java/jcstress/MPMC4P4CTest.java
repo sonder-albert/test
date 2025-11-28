@@ -20,7 +20,7 @@ import queue.MPMCLockFreeUnboundedQueue;
 public class MPMC4P4CTest {
 
     // 队列实例
-    final MPMCLockFreeUnboundedQueue<Integer> q = new MPMCLockFreeUnboundedQueue<>();
+    final MPMCLockFreeUnboundedQueue<Integer> q = new MPMCLockFreeUnboundedQueue<>(1024);
 
     // --- 4个生产者，分别放入不同的权重值 ---
 

@@ -16,7 +16,7 @@ class MPMCLockFreeUnboundedQueueTest {
     @Test
     void testBasicPutPollSingleProducerConsumer() {
         q=null;
-        q = new MPMCLockFreeUnboundedQueue<>();
+        q = new MPMCLockFreeUnboundedQueue<>(1024);
         // producer
         long v = System.nanoTime();
         q.offer(v);
@@ -31,7 +31,7 @@ class MPMCLockFreeUnboundedQueueTest {
     @RepeatedTest(5)
     void testConcurrentPutPollManyProducersConsumers() throws InterruptedException {
         q=null;
-        q = new MPMCLockFreeUnboundedQueue<>();
+        q = new MPMCLockFreeUnboundedQueue<>(1024);
         final int PRODUCERS = 4;
         final int CONSUMERS = 4;
         final int OPS = 1000; // 每个生产者尝试放入的次数
@@ -100,7 +100,7 @@ class MPMCLockFreeUnboundedQueueTest {
     @Test
     void testPollOnEmptyReturnsNull() {
         q=null;
-        q = new MPMCLockFreeUnboundedQueue<>();
+        q = new MPMCLockFreeUnboundedQueue<>(1024);
         assertNull(q.poll(), "空队列应返回 null");
     }
 
@@ -108,7 +108,7 @@ class MPMCLockFreeUnboundedQueueTest {
     @Test
     void testManyPutPollCycles() {
         q=null;
-        q = new MPMCLockFreeUnboundedQueue<>();
+        q = new MPMCLockFreeUnboundedQueue<>(1024);
         int rounds = 1000;
         for (int i = 0; i < rounds; i++) {
             long v = i;

@@ -14,11 +14,11 @@
             <artifactId>jctools-core</artifactId>
             <version>4.0.3</version>
         </dependency>
-<!--        <dependency>-->
-<!--            <groupId>org.openjdk.jol</groupId>-->
-<!--            <artifactId>jol-core</artifactId>-->
-<!--            <version>0.17</version>-->
-<!--        </dependency>-->
+        <!--        <dependency>-->
+        <!--            <groupId>org.openjdk.jol</groupId>-->
+        <!--            <artifactId>jol-core</artifactId>-->
+        <!--            <version>0.17</version>-->
+        <!--        </dependency>-->
         <dependency>
             <groupId>org.openjdk.jcstress</groupId>
             <artifactId>jcstress-core</artifactId>
@@ -26,12 +26,11 @@
         </dependency>
 
 
-    
-<!--      <dependency>-->
-<!--        <groupId>foundation.icon</groupId>-->
-<!--        <artifactId>javaee-scorex</artifactId>-->
-<!--        <version>0.5.4.1</version>-->
-<!--      </dependency>-->
+        <!--      <dependency>-->
+        <!--        <groupId>foundation.icon</groupId>-->
+        <!--        <artifactId>javaee-scorex</artifactId>-->
+        <!--        <version>0.5.4.1</version>-->
+        <!--      </dependency>-->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
@@ -43,13 +42,11 @@
             <groupId>org.openjdk.jmh</groupId>
             <artifactId>jmh-core</artifactId>
             <version>1.37</version>
-            <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.openjdk.jmh</groupId>
             <artifactId>jmh-generator-annprocess</artifactId>
             <version>1.37</version>
-            <scope>test</scope>
         </dependency>
     </dependencies>
 
@@ -63,13 +60,21 @@
                     <target>23</target>
                     <compilerArgs>--enable-preview</compilerArgs>
                     <!-- 关键修复：显式指定注解处理器路径 -->
-<!--                    <annotationProcessorPaths>-->
-<!--                        <path>-->
-<!--                            <groupId>org.openjdk.jcstress</groupId>-->
-<!--                            <artifactId>jcstress-core</artifactId>-->
-<!--                            <version>0.16</version>-->
-<!--                        </path>-->
-<!--                    </annotationProcessorPaths>-->
+                    <!--                    <annotationProcessorPaths>-->
+                    <!--                        <path>-->
+                    <!--                            <groupId>org.openjdk.jcstress</groupId>-->
+                    <!--                            <artifactId>jcstress-core</artifactId>-->
+                    <!--                            <version>0.16</version>-->
+                    <!--                        </path>-->
+                    <!--                    </annotationProcessorPaths>-->
+                    <!--jmh和jcstress的注解处理器是冲突的-->
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.openjdk.jmh</groupId>
+                            <artifactId>jmh-generator-annprocess</artifactId>
+                            <version>1.37</version>
+                        </path>
+                    </annotationProcessorPaths>
                 </configuration>
             </plugin>
             <!-- 必须：Shade 插件用于打包可执行 jar -->
@@ -91,7 +96,8 @@
                                         implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>org.openjdk.jcstress.Main</mainClass>
                                 </transformer>
-                                <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
+                                <transformer
+                                        implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
                                     <resource>META-INF/TestList</resource>
                                 </transformer>
                             </transformers>

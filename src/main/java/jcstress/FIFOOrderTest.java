@@ -17,7 +17,7 @@ import queue.MPMCLockFreeUnboundedQueue;
 @Outcome(id = "0, 0", expect = Expect.FORBIDDEN, desc = "Violation: Data corruption")
 public class FIFOOrderTest {
 
-    final MPMCLockFreeUnboundedQueue<Integer> q = new MPMCLockFreeUnboundedQueue<>();
+    final MPMCLockFreeUnboundedQueue<Integer> q = new MPMCLockFreeUnboundedQueue<>(1024);
 
     @Actor
     public void producer() {

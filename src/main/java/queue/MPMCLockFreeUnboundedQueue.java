@@ -1,483 +1,353 @@
 package queue;
 
+import module java.base;
+
+import jdk.internal.misc.Unsafe;
 import jdk.internal.vm.annotation.Contended;
+import jdk.internal.vm.annotation.ForceInline;
 
-import java.lang.invoke.MethodHandles;
-import java.lang.invoke.VarHandle;
-import java.lang.ref.Cleaner;
 import java.util.Objects;
-import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.LockSupport;
-
 
 public class MPMCLockFreeUnboundedQueue<E> {
-    //SEGMENT
-    private static final int STRIDE = 8;
-    private static final int SEGMENT_CAPACITY = 1024;
-    private static final int SEGMENT_MASK = SEGMENT_CAPACITY - 1;
+    //SEGMENT field
+    private static final byte STRIDE_SHIFT = 3;
+    private final int SEGMENT_CAPACITY;
+    private final int SEGMENT_MASK;
 
-    private static final VarHandle LONG_ARRAY_HANDLE;
-    private static final VarHandle OBJECT_ARRAY_HANDLE;
+    private final int SEG_SHIFT;
+    private final int CPUS;
 
-    //EPOCH
-    @Contended
-    private final AtomicLong PRODUCER_EPOCH = new AtomicLong(-1);
-    @Contended
-    private final AtomicLong CONSUMED = new AtomicLong(0);
+    // Unsafe & Offsets
+    private static final Unsafe UNSAFE;
+    private static final long LONG_ARRAY_BASE;
+    private static final int LONG_ARRAY_SHIFT;
+    private static final long OBJECT_ARRAY_BASE;
+    private static final int OBJECT_ARRAY_SHIFT;
+    private static final int SEQ_ENTRY_SHIFT;
+    private static final int ITEM_ENTRY_SHIFT;
 
-    //RECLAIM
-    @Contended
-    private final MPMCRingBuffer<Segment<E>> freeList;
-    @Contended
-    private final MPMCRingBuffer<Segment<E>> retiredList;
+    private static final long PRODUCER;
+    private static final long CONSUMER;
+    private static final long HEAD;
+    private static final long TAIL;
+    private static final long SEGMENT_STATE;
+    private static final long SEGMENT_NEXT;
+    private static final long SEGMENT_PREV;
+    private static final long SEGMENT_CONSUMED;
+    private static final long SEGMENT_PRODUCED;
 
-    @Contended
-    private final Segment<E> ALLOCATING = new Segment<>(Long.MIN_VALUE);
-    //local retired buffer
-    private static final int LOCAL_RETIRED_CAPACITY = 64;
-    private final ThreadLocal<LocalBufferHolder<E>> LOCAL_BUFFER;
-    private final Cleaner CLEANER = Cleaner.create();
+    @Contended("producer")
+    private volatile long producer = 0;
+    @Contended("producer")
+    private volatile Segment<E> tail;
+    @Contended("producer")
+    private final ThreadLocal<Segment<E>> LAST_KNOWN_PRODUCER;
+    @Contended("consumer")
+    private volatile long consumer = 0;
+    @Contended("consumer")
+    private volatile Segment<E> head;
+    @Contended("consumer")
+    private final ThreadLocal<Segment<E>> LAST_KNOWN_CONSUMER;
 
-    //queue filed
-    @Contended
-    final AtomicReference<Segment<E>> head;
-    @Contended
-    final AtomicReference<Segment<E>> tail;
-
+    //init handles
     static {
         try {
-            LONG_ARRAY_HANDLE = MethodHandles.arrayElementVarHandle(long[].class);
-            OBJECT_ARRAY_HANDLE = MethodHandles.arrayElementVarHandle(Object[].class);
-        } catch (IllegalArgumentException e) {
+            // 1. Setup Unsafe
+            UNSAFE = Unsafe.getUnsafe();
+
+            // 2. Setup Array Offsets
+            LONG_ARRAY_BASE = UNSAFE.arrayBaseOffset(long[].class);
+            int longScale = UNSAFE.arrayIndexScale(long[].class);
+            if ((longScale & (longScale - 1)) != 0) {
+                throw new Error("long[] data type scale not a power of two");
+            }
+            LONG_ARRAY_SHIFT = 31 - Integer.numberOfLeadingZeros(longScale);
+            SEQ_ENTRY_SHIFT = LONG_ARRAY_SHIFT + STRIDE_SHIFT;
+
+            OBJECT_ARRAY_BASE = UNSAFE.arrayBaseOffset(Object[].class);
+            int objScale = UNSAFE.arrayIndexScale(Object[].class);
+            if ((objScale & (objScale - 1)) != 0) {
+                throw new Error("Object[] data type scale not a power of two");
+            }
+            OBJECT_ARRAY_SHIFT = 31 - Integer.numberOfLeadingZeros(objScale);
+            ITEM_ENTRY_SHIFT = OBJECT_ARRAY_SHIFT + STRIDE_SHIFT;
+
+            // 获取字段偏移量，消除 VarHandle 开销
+            PRODUCER = UNSAFE.objectFieldOffset(MPMCLockFreeUnboundedQueue.class.getDeclaredField("producer"));
+            CONSUMER = UNSAFE.objectFieldOffset(MPMCLockFreeUnboundedQueue.class.getDeclaredField("consumer"));
+            HEAD = UNSAFE.objectFieldOffset(MPMCLockFreeUnboundedQueue.class.getDeclaredField("head"));
+            TAIL = UNSAFE.objectFieldOffset(MPMCLockFreeUnboundedQueue.class.getDeclaredField("tail"));
+            SEGMENT_STATE = UNSAFE.objectFieldOffset(Segment.class.getDeclaredField("state"));
+            SEGMENT_NEXT = UNSAFE.objectFieldOffset(Segment.class.getDeclaredField("next"));
+            SEGMENT_PREV = UNSAFE.objectFieldOffset(Segment.class.getDeclaredField("prev"));
+            SEGMENT_CONSUMED = UNSAFE.objectFieldOffset(Segment.class.getDeclaredField("consumed"));
+            SEGMENT_PRODUCED = UNSAFE.objectFieldOffset(Segment.class.getDeclaredField("produced"));
+        } catch (IllegalArgumentException | NoSuchFieldException e) {
             throw new RuntimeException(e);
         }
     }
 
+    @SuppressWarnings("unchecked")
+    public MPMCLockFreeUnboundedQueue(int capacity) {
+        SEGMENT_CAPACITY = capacity;
+        SEGMENT_MASK = capacity - 1;
+        SEG_SHIFT = 31 - Integer.numberOfLeadingZeros(SEGMENT_CAPACITY);
+
+        head = tail = new Segment<>(0, capacity, SEG_SHIFT);
+
+        LAST_KNOWN_PRODUCER = ThreadLocal.withInitial(() -> (Segment<E>) UNSAFE.getReferenceAcquire(this, TAIL));
+        LAST_KNOWN_CONSUMER = ThreadLocal.withInitial(() -> (Segment<E>) UNSAFE.getReferenceAcquire(this, HEAD));
+        CPUS = Runtime.getRuntime().availableProcessors();
+    }
+
     @Contended
     static final class Segment<E> {
-        //actual storage
-        final E[] items;
-        // per-slot sequence numbers,liner based
-        final long[] sequences;
-        final AtomicReference<Segment<E>> next = new AtomicReference<>(null);
-        //该 segment 的 0 槽对应的全局 seq
-        volatile long baseSeq;
-        final int capacity;
-        volatile long epoch;
-        final AtomicInteger consumed = new AtomicInteger(0);
+        static final byte NOT_LINKED = 0;
+        static final byte LINKED = 1;
+        static final byte REMOVED = 2;
 
+        volatile byte state = NOT_LINKED;
+        volatile Segment<E> next;
+        volatile Segment<E> prev;
+
+        final long base;
+        final long limit;
+
+        final long index;
+        @Contended("consumer")
+        volatile int consumed;
+        @Contended("producer")
+        volatile int produced;
+        //item and sequence index = global seq - base
+        //actual storage
+        volatile E[] items;
+        // per-slot sequence numbers,liner based
+        volatile long[] sequences;
+
+        //初始化不需要加fence,因为segment创建状态只会被一个线程抢占
         @SuppressWarnings("unchecked")
-        Segment(long baseSeq) {
-            this.baseSeq = baseSeq;
-            this.capacity = SEGMENT_CAPACITY;
-            int paddedLength = capacity * STRIDE;
+        Segment(long base, int capacity, int shift) {
+            this.base = base;
+            this.limit = base + capacity;
+            this.index = base >>> shift;
+            int paddedLength = capacity << STRIDE_SHIFT;
             this.items = (E[]) new Object[paddedLength];
             this.sequences = new long[paddedLength];
             // 初始化 sequences：slot i 对应的 index = i*stride
             for (int i = 0; i < capacity; i++) {
-                this.sequences[i * STRIDE] = baseSeq + i;
-            }
-            VarHandle.releaseFence();
-        }
-
-        public boolean ownsSeq(long seq) {
-            return seq >= baseSeq && seq < baseSeq + capacity;
-        }
-
-        public void reset(long newBase) {
-            this.baseSeq = newBase;
-            this.epoch = 0;
-            consumed.set(0);
-            VarHandle.releaseFence();
-            this.next.setRelease(null);
-            for (int i = 0; i < capacity; i++) {
-                LONG_ARRAY_HANDLE.setRelease(sequences, i * STRIDE, baseSeq + i);
-            }
-            for (int i = 0; i < capacity; i++) {
-                OBJECT_ARRAY_HANDLE.setRelease(items, i * STRIDE, null);
-            }
-        }
-    }
-
-    static final class MPMCRingBuffer<E> {
-        private final Object[] buffer;
-        private final int mask;
-        private long producerIndex = 0;
-        private long consumerIndex = 0;
-
-        private static final VarHandle P_INDEX;
-        private static final VarHandle C_INDEX;
-
-        static {
-            try {
-                MethodHandles.Lookup l = MethodHandles.lookup();
-                P_INDEX = l.findVarHandle(MPMCRingBuffer.class, "producerIndex", long.class);
-                C_INDEX = l.findVarHandle(MPMCRingBuffer.class, "consumerIndex", long.class);
-            } catch (Exception e) {
-                throw new RuntimeException(e);
+                this.sequences[i << STRIDE_SHIFT] = base + i;
             }
         }
 
-        @SuppressWarnings("unchecked")
-        public MPMCRingBuffer(int capacity) {
-            buffer = new Segment[capacity];
-            mask = capacity - 1;
-        }
-
-        E poll() {
-            long p;
-            long c;
-            do {
-                p = (long) P_INDEX.getAcquire(this);
-                c = (long) C_INDEX.getAcquire(this);
-                if (c >= p) {
-                    return null;
-                }
-            } while (!C_INDEX.compareAndSet(this, c, c + 1));
-
-            int slot = (int) (c & mask);
-            @SuppressWarnings("unchecked")
-            Segment<E> e = (Segment<E>) OBJECT_ARRAY_HANDLE.getAcquire(buffer, slot);
-            if (e != null) {
-                OBJECT_ARRAY_HANDLE.setRelease(buffer, slot, null);
-                return (E) e;
-            }
-            return null;
-        }
-
-        E peek() {
-            long p = (long) P_INDEX.getAcquire(this);
-            long c = (long) C_INDEX.getAcquire(this);
-            if (c >= p) {
-                return null;
-            }
-            int slot = (int) (c & mask);
-            @SuppressWarnings("unchecked")
-            E e = (E) OBJECT_ARRAY_HANDLE.getAcquire(buffer, slot);
-            return e;
-        }
-
-        public void offer(E e) {
-            while (true) {
-                long p = (long) P_INDEX.getAcquire(this);
-                long c = (long) C_INDEX.getAcquire(this);
-                if (p - c >= buffer.length) {
-                    Thread.onSpinWait();
-                    continue;
-                }
-                if (P_INDEX.compareAndSet(this, p, p + 1)) {
-                    int slot = (int) (p & mask);
-                    OBJECT_ARRAY_HANDLE.setRelease(buffer, slot, e);
-                    return;
-                }
-            }
-        }
-    }
-
-    static final class LocalBufferHolder<E> implements Runnable {
-        Segment<E> localHead;
-        Segment<E> localTail;
-
-        final Segment<E>[] freshMono;
-        final Segment<E>[] retiredList;
-        int size;
-
-        final MPMCRingBuffer<Segment<E>> globalRetiredList;
-
-        @SuppressWarnings("unchecked")
-        LocalBufferHolder(int capacity, Segment<E> head, Segment<E> tail,
-                          MPMCRingBuffer<Segment<E>> globalRetiredList) {
-            retiredList = new Segment[capacity];
-            freshMono = new Segment[1];
-            this.localHead = head;
-            this.localTail = tail;
-            this.globalRetiredList = globalRetiredList;
-        }
-
-        void addLocalRetired(Segment<E> segment) {
-            retiredList[size++] = segment;
-        }
-
-        void addMono(Segment<E> segment) {
-            freshMono[0] = segment;
-        }
-
-        Segment<E> getMono() {
-            Segment<E> value = freshMono[0];
-            if (value == null) {
-                return null;
-            }
-            freshMono[0] = null;
-            return value;
-        }
-
-        Segment<E> peekMono() {
-            return freshMono[0];
-        }
-
-        void removeMono() {
-            freshMono[0].next.setRelease(null);
-            freshMono[0] = null;
-        }
-
-        @Override
-        public void run() {
-            // producer epoch clean
-            for (int i = size; i >= 0; i--) {
-                Segment<E> seg = retiredList[i];
-                if (seg != null) {
-                    if (seg.consumed.get() == SEGMENT_CAPACITY) {
-                        globalRetiredList.offer(seg);
-                    }
-                    seg.next.setRelease(null);
-                    retiredList[i] = null;
-                }
-            }
-            Segment<E> mono = peekMono();
-            if (mono != null && mono.consumed.get() == SEGMENT_CAPACITY) {
-                removeMono();
-                globalRetiredList.offer(mono);
-            }
-            size = 0;
-            VarHandle.releaseFence();
-        }
-    }
-
-    // 将本地 retired 缓冲 flush 到全局 retiredPool
-    private void flushLocalRetired(LocalBufferHolder<E> buf) {
-        int c = buf.size;
-        if (c == 0) return;
-
-        for (int i = 0; i < c; i++) {
-            Segment<E> re = buf.retiredList[i];
-            retiredList.offer(re);
-            buf.retiredList[i] = null;
-        }
-        buf.size = 0;
-        VarHandle.releaseFence();
-    }
-
-    private void retireSegment(Segment<E> s, LocalBufferHolder<E> buf) {
-        buf.addLocalRetired(s);
-        if (buf.size >= LOCAL_RETIRED_CAPACITY) {
-            tryReclaim();
-            flushLocalRetired(buf);
-        }
-    }
-
-    private void tryReclaim() {
-        LocalBufferHolder<E> buf = LOCAL_BUFFER.get();
-        int reclaimed = 0;
-        Segment<E> rs;
-        while (reclaimed < LOCAL_RETIRED_CAPACITY
-                && (rs = retiredList.peek()) != null) {
-            // 标准 EBR 检查：只有当 segment 全部被消费完毕时才回收
-            // 还没到安全回收的时候,retiredList 应该是有序的，如果头都不能回收，后面的也不能
-            //check segment whether all consumed
-            if (rs.consumed.getAcquire() != SEGMENT_CAPACITY) break;
-            rs = retiredList.poll();
-            // 还没到安全回收的时候,retiredList 应该是有序的，如果头都不能回收，后面的也不能
-            if (rs == null) break;
-            rs.next.setOpaque(null);
-            //case 1 add local mono
-            if (buf.peekMono() == null) {
-                buf.addMono(rs);
-            } else {
-                //case 2 add global free list
-                freeList.offer(rs);
-            }
-            reclaimed++;
-        }
-        VarHandle.releaseFence();
-    }
-
-    public MPMCLockFreeUnboundedQueue() {
-        Segment<E> first = new Segment<>(0);
-        head = new AtomicReference<>(first);
-        tail = new AtomicReference<>(first);
-        freeList = new MPMCRingBuffer<>(1024);
-        retiredList = new MPMCRingBuffer<>(1024);
-        LOCAL_BUFFER = ThreadLocal.withInitial(() -> {
-            LocalBufferHolder<E> holder = new LocalBufferHolder<>(
-                    LOCAL_RETIRED_CAPACITY,
-                    head.getAcquire(),
-                    tail.getAcquire(),
-                    retiredList
-            );
-            CLEANER.register(Thread.currentThread(), holder);
-            return holder;
-        });
-    }
-
-    private static void backOff(int count) {
-        if (count < 3) {
-            //fast path spin
-            Thread.onSpinWait();
-            return;
-        }
-        //exponential backoff
-        int shift = Math.min(count, 20);
-        long delay = (1L << shift) + ThreadLocalRandom.current().nextLong(50);
-        LockSupport.parkNanos(delay);
-    }
-
-    private Segment<E> locateSegmentForPut(long seq, int count, LocalBufferHolder<E> local) {
-        while (true) {
-            Segment<E> curTail = local.localTail;
-            //check bound
-            if (curTail.ownsSeq(seq)) return curTail;
-
-            long newBase = curTail.baseSeq + SEGMENT_CAPACITY;
-            //seq > newBase,link new segment
-            if (seq >= newBase) {
-                //check has next
-                Segment<E> next = curTail.next.getAcquire();
-                if (next != null) {
-                    //wait : other thread constructing and linking
-                    if (next == ALLOCATING) {
-                        backOff(++count);
-                        continue;
-                    }
-                    //
-                    this.tail.compareAndSet(curTail, next);
-                    local.localTail = next;
-                    continue;
-                }
-                //fast path: reuse pooled segment
-                //case1 get thread local mono
-                Segment<E> pooled = local.getMono();
-                //case2 get global free list
-                if (pooled == null) pooled = freeList.poll();
-                //try to link pooled
-                //double check,next may constructed by other thread
-                if (pooled != null) {
-                    // 如果有缓存对象，直接 CAS 链接
-                    if (curTail.next.compareAndSet(null, pooled)) {
-                        pooled.reset(newBase);
-                        this.tail.compareAndSet(curTail, pooled);
-                        local.localTail = pooled;
-                        continue;
-                    }
-                    // Step 4: CAS failed → another thread linked → update tailSeg -> seg offer back free list
-                    Segment<E> realNext = curTail.next.getAcquire();
-                    if (realNext != null && realNext != ALLOCATING) {
-                        local.localTail = realNext;
-                        this.tail.compareAndSet(curTail, realNext);
-                    }
-                    if (local.peekMono() == null) {
-                        local.addMono(pooled);
-                    } else {
-                        freeList.offer(pooled);
-                    }
-                    continue;
-                }
-                //slow path: construct new segment
-                if (curTail.next.compareAndSet(null, ALLOCATING)) {
-                    try {
-                        Segment<E> fresh = new Segment<>(newBase);
-
-                        // 将占位符替换为真实对象 (setRelease 保证可见性)
-                        curTail.next.setRelease(fresh);
-
-                        // 顺便推进 tail
-                        this.tail.compareAndSet(curTail, fresh);
-                        local.localTail = fresh;
-                    } catch (Throwable t) {
-                        // 防御性编程：万一 OOM 了，把坑位还原，否则队列死锁
-                        curTail.next.compareAndSet(ALLOCATING, null);
-                    }
-                }
-            }
-            backOff(++count);
+        //@ForceInline
+        public boolean owns(long seq) {
+            return seq >= base && seq < limit;
         }
     }
 
     //Vyukov-style: sequence-based，0 slot CAS
     public void offer(E value) {
         Objects.requireNonNull(value);
-        LocalBufferHolder<E> local = LOCAL_BUFFER.get();
-        long seq = PRODUCER_EPOCH.getAndIncrement() + 1;
-        int count = 0;
 
-        while (true) {
+        long seq = UNSAFE.getAndAddLong(this, PRODUCER, 1);
 
-            Segment<E> tailSeg = locateSegmentForPut(seq, count, local);
+        Segment<E> seg = locateSegment(seq, TAIL, true);
 
-            int slot = (int) (seq & SEGMENT_MASK) * STRIDE;
-            long observed = (long) LONG_ARRAY_HANDLE.getAcquire(tailSeg.sequences, slot);
-            if (seq == observed &&
-                    OBJECT_ARRAY_HANDLE.compareAndSet(tailSeg.items, slot, null, value)) {
-                LONG_ARRAY_HANDLE.setRelease(tailSeg.sequences, slot, seq + 1);
-                return;
-            }
-            backOff(++count);
+        // 2. Calculate byte offsets for Unsafe access
+        long seqOffset = LONG_ARRAY_BASE + ((seq & SEGMENT_MASK) << SEQ_ENTRY_SHIFT);
+        long itemOffset = OBJECT_ARRAY_BASE + ((seq & SEGMENT_MASK) << ITEM_ENTRY_SHIFT);
+        //dont need volatile, because seq is xadd option and sequence always increment
+        while (UNSAFE.getLongVolatile(seg.sequences, seqOffset) != seq) {
+            Thread.onSpinWait();
+        }
+        UNSAFE.putReferenceRelease(seg.items, itemOffset, value);
+        // 5. Update Sequence (Release Semantics)
+        UNSAFE.putLongRelease(seg.sequences, seqOffset, seq + 1);
+        int put = UNSAFE.getAndAddInt(seg, SEGMENT_PRODUCED, 1);
+
+        //first producer publish
+        if (put == 0) {
+            casGlobal(seg, TAIL);
+        }
+        //last producer expand
+        if ((seq & SEGMENT_MASK) == 0 || put == SEGMENT_MASK) {
+            checkExpand(seg);
         }
     }
 
     //Vyukov-style: sequence-based，0 slot CAS
     public E poll() {
-        LocalBufferHolder<E> local = LOCAL_BUFFER.get();
-        int count = 0;
+        long seq = UNSAFE.getAndAddLong(this, CONSUMER, 1);
+        // 1. Calculate Offsets
+        long seqOffset = LONG_ARRAY_BASE + ((seq & SEGMENT_MASK) << SEQ_ENTRY_SHIFT);
+        long itemOffset = OBJECT_ARRAY_BASE + ((seq & SEGMENT_MASK) << ITEM_ENTRY_SHIFT);
 
-        while (true) {
-            long seq = CONSUMED.getAcquire();
-            Segment<E> headSeg = locateSegmentForTake(local, seq);
-            int slot = (int) (seq & SEGMENT_MASK) * STRIDE;
-            long observe = (long) LONG_ARRAY_HANDLE.getAcquire(headSeg.sequences, slot);
-
-            if (observe == seq + 1) {
-                @SuppressWarnings("unchecked")
-                E value = (E) OBJECT_ARRAY_HANDLE.getAcquire(headSeg.items, slot);
-
-                if (value != null && CONSUMED.compareAndSet(seq, seq + 1)) {
-                    OBJECT_ARRAY_HANDLE.setRelease(headSeg.items, slot, null);
-                    LONG_ARRAY_HANDLE.setRelease(headSeg.sequences, slot, seq + SEGMENT_CAPACITY);
-                    headSeg.consumed.incrementAndGet();
-                    return value;
-                }
-            } else if (observe > seq + 1) {
-                count = 0;
-            }
-            //strict check empty
-            if (count > 200 &&
-                    CONSUMED.getAcquire() >= PRODUCER_EPOCH.getAcquire() &&
-                    headSeg.next.getAcquire() == null) {
-                return null;
-            }
-            //if race happen.spin
-            backOff(++count);
+        Segment<E> seg = locateSegment(seq, HEAD, false);
+        while (UNSAFE.getLongAcquire(seg.sequences, seqOffset) != seq + 1) {
+            Thread.onSpinWait();
         }
+        @SuppressWarnings("unchecked")
+        E e = (E) UNSAFE.getAndSetReferenceRelease(seg.items, itemOffset, null);
+        int take = UNSAFE.getAndAddInt(seg, SEGMENT_CONSUMED, 1);
+
+        //first consumer publish
+        if (take == 0) {
+            casGlobal(seg, HEAD);
+        }
+        //last consumer clean
+        if (take == SEGMENT_MASK) {
+            tryClean(seg);
+        }
+        return e;
     }
 
-    private Segment<E> locateSegmentForTake(LocalBufferHolder<E> local, long seq) {
-        Segment<E> next;
-        Segment<E> currentHead;
-        int count = 0;
-        while (true) {
-            currentHead = local.localHead;
-
-            if (currentHead.ownsSeq(seq)) {
-                return currentHead;
+    // 辅助方法：CAS 更新global head\tail
+    @SuppressWarnings("unchecked")
+    @ForceInline
+    private void casGlobal(Segment<E> s, long global) {
+        Segment<E> cur;
+        do {
+            cur = (Segment<E>) UNSAFE.getReferenceVolatile(this, global);
+            // 如果当前 HEAD 已经比 newHead 新（index 更大），则不需要更新，直接退出
+            if (cur.index >= s.index) {
+                return;
             }
+            // CAS 失败则重试，确保不会发生 ABA 或回滚
+        } while (!UNSAFE.compareAndSetReference(this, global, cur, s));
+    }
 
-            //find next,promise current segment all slot consumed
-            if (currentHead.consumed.getAcquire() == SEGMENT_CAPACITY) {
-                next = currentHead.next.getAcquire();
-
-                if (next != null && next != ALLOCATING) {
-                    local.localHead = next;
-                    if (this.head.compareAndSet(currentHead, next)) {
-                        retireSegment(currentHead, local);
+    @SuppressWarnings("unchecked")
+    @ForceInline
+    private Segment<E> locateSegment(long seq, long global, boolean forPut) {
+        ThreadLocal<Segment<E>> tl = forPut ? LAST_KNOWN_PRODUCER : LAST_KNOWN_CONSUMER;
+        //fast path
+        Segment<E> cur = (Segment<E>) UNSAFE.getReferenceAcquire(this, global);
+        if (cur.owns(seq)) {
+            if ((seq & 31) == 0) {
+                Segment<E> last = tl.get();
+                if (last != cur) {
+                    tl.set(cur);
+                }
+            }
+            return cur;
+        }
+        //local cache
+        Segment<E> last = tl.get();
+        if (last.owns(seq)) {
+            return last;
+        }
+        long expected = seq >>> SEG_SHIFT;
+        long index = cur.index;
+        long diff = Math.abs(expected - index);
+        //heuristic search
+        if (diff > STRIDE_SHIFT) {
+            if (Math.abs(expected - last.index) < diff) {
+                cur = last;
+            }
+        }
+        //cold path
+        while (!cur.owns(seq)) {
+            //slow path: seq larger than cur get next
+            while (seq >= cur.limit) {
+                Segment<E> next = (Segment<E>) UNSAFE.getReferenceAcquire(cur, SEGMENT_NEXT);
+                if (next != null && UNSAFE.getByteAcquire(next, SEGMENT_STATE) != Segment.REMOVED) {
+                    cur = next;
+                } else {
+                    if (forPut) {
+                        //走到最新的地方了,真正需要参与扩容
+                        if (cur.index == expected - 1) {
+                            checkExpand(cur);
+                        } else {
+                            //next走到一半被clean方法清空了,需要交给外层循环处理
+                            cur = (Segment<E>) UNSAFE.getReferenceAcquire(this, global);
+                            break;
+                        }
+                    } else {
+                        Thread.onSpinWait();
                     }
                 }
             }
-            //consumer spin waiting producer link new head
-            backOff(++count);
+            //slow path: seq < seg base,from head find next
+            while (seq < cur.base) {
+                Segment<E> prev = (Segment<E>) UNSAFE.getReferenceAcquire(cur, SEGMENT_PREV);
+                if (prev != null && UNSAFE.getByteAcquire(prev, SEGMENT_STATE) != Segment.REMOVED) {
+                    cur = prev;
+                } else {
+                    //prev走到一半被clean方法清空了,需要交给外层循环处理
+                    cur = (Segment<E>) UNSAFE.getReferenceAcquire(this, global);
+                    break;
+                }
+            }
+        }
+        tl.set(cur);
+        return cur;
+    }
+
+    @SuppressWarnings("unchecked")
+    @ForceInline
+    private void tryClean(Segment<E> cur) {
+        Segment<E> p = cur.prev;
+        //clean prev
+        while (p != null) {
+            Segment<E> prev = (Segment<E>) UNSAFE.getReferenceAcquire(p, SEGMENT_PREV);
+            int consumed = UNSAFE.getIntAcquire(p, SEGMENT_CONSUMED);
+            if (consumed != SEGMENT_CAPACITY) {
+                break;
+            }
+            if (UNSAFE.compareAndSetByte(p, SEGMENT_STATE, Segment.LINKED, Segment.REMOVED)) {
+                Segment<E> next = (Segment<E>) UNSAFE.getReferenceAcquire(p, SEGMENT_NEXT);
+                //链接前后
+                if (prev != null) {
+                    UNSAFE.putReferenceVolatile(prev, SEGMENT_NEXT, next);
+                }
+                if (next != null) {
+                    UNSAFE.putReferenceVolatile(next, SEGMENT_PREV, prev);
+                }
+                UNSAFE.putReferenceVolatile(p, SEGMENT_PREV, null);
+                //UNSAFE.putReferenceVolatile(p, SEGMENT_NEXT, null);
+                //释放大对象
+                p.items = null;
+                p.sequences = null;
+                p = prev;
+            }
         }
     }
 
+    @SuppressWarnings("unchecked")
+    @ForceInline
+    private void checkExpand(Segment<E> cur) {
+        int failure = 0;
+        while (true) {
+            Segment<E> next = (Segment<E>) UNSAFE.getReferenceAcquire(cur, SEGMENT_NEXT);
+            //truth publish
+            if (next != null) {
+                return;
+            }
+            byte state = UNSAFE.getByteAcquire(cur, SEGMENT_STATE);
+            //waiting next publish
+            if (state == Segment.LINKED) {
+                Thread.onSpinWait();
+                continue;
+            }
+            //spin first,if too long not ready,race create
+            if (failure++ != 0 && failure < (CPUS >> 1)) {
+                Thread.onSpinWait();
+                continue;
+            }
+            //Speculative Creation
+            Segment<E> fresh = new Segment<>(cur.limit, SEGMENT_CAPACITY, SEG_SHIFT);
+            UNSAFE.putReferenceRelease(fresh, SEGMENT_PREV, cur);
+            //Final Decision: CAS Next
+            if (UNSAFE.compareAndSetReference(cur, SEGMENT_NEXT, null, fresh)) {
+                //volatile publish
+                UNSAFE.putByteVolatile(cur, SEGMENT_STATE, Segment.LINKED);
+                return;
+            } else {
+                UNSAFE.putReferenceRelease(fresh, SEGMENT_PREV, null);
+            }
+        }
+    }
 }
+
+
 
